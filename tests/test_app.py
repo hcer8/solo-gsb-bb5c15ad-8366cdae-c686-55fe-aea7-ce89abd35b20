@@ -42,6 +42,7 @@ from app.linewrap import (
     plan_wrap,
     wrap_document,
 )
+from app.locate import LocateError, gap_ms, locate_lines, normalize
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
 from app.placement import (
     Block,
@@ -2946,5 +2947,230 @@ def test_api_cut_avoid_validates_fields():
 
 def test_api_cut_avoid_rejects_bad_srt():
     resp = client.post("/api/cut-avoid", json=cutavoid_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+# ---------- 台词定位 ----------
+
+LOCATE_SRT = (
+    "1\n00:00:01,000 --> 00:00:03,000\n今天我们来聊一聊\n\n"
+    "2\n00:00:03,200 --> 00:00:05,500\n人工智能的新进展\n\n"
+    "3\n00:00:09,000 --> 00:00:11,000\n人工智能，正在改变生活\n\n"
+    "4\n00:00:11,000 --> 00:00:13,000\n的方方面面。\n"
+)
+
+
+def _locate_cues():
+    return parse_srt(LOCATE_SRT)
+
+
+def test_normalize_drops_space_and_punctuation_and_casefolds():
+    result = normalize(" Hello, 世界！\nStraße ")
+    assert result.text == "hello世界strasse"
+    # ß casefold 展开为 ss：两个折叠字符映射到同一原偏移
+    assert result.offsets[-3] == result.offsets[-2]
+    assert normalize("，。！　 \n\t").text == ""
+
+
+def test_gap_ms_overlap_counts_as_zero():
+    cues = _locate_cues()
+    assert gap_ms(cues[0], cues[1]) == 200  # 3200 - 3000
+    # 时间倒序 / 重叠：间隔按 0 计
+    overlap = parse_srt(
+        "1\n00:00:02,000 --> 00:00:04,000\n前文\n\n"
+        "2\n00:00:01,500 --> 00:00:03,000\n后文\n"
+    )
+    assert gap_ms(overlap[0], overlap[1]) == 0
+
+
+def test_locate_single_cue_hit_within_text():
+    hits = locate_lines(_locate_cues(), "人工智能", 500)
+    assert len(hits) == 2
+    assert [h.cue_order_from for h in hits] == [2, 3]
+    assert all(not h.cross_cue for h in hits)
+    assert hits[0].snippet == "人工智能"
+    assert (hits[0].start, hits[0].end) == (3200, 5500)
+    # 命中按文档顺序编号
+    assert [h.order for h in hits] == [1, 2]
+
+
+def test_locate_cross_cue_allowed_within_gap_threshold():
+    hits = locate_lines(_locate_cues(), "聊一聊人工智能的新进展", 500)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.cross_cue
+    assert (hit.cue_order_from, hit.cue_order_to) == (1, 2)
+    assert (hit.start, hit.end) == (1000, 5500)
+    assert hit.snippet == "聊一聊人工智能的新进展"
+    # 跨条片段按各条实际命中范围截取，不带相邻文字
+    assert [(s.cue_order, s.snippet) for s in hit.segments] == [
+        (1, "聊一聊"),
+        (2, "人工智能的新进展"),
+    ]
+
+
+def test_locate_cross_cue_blocked_beyond_gap_threshold():
+    # 间隔 200ms：阈值 100 时不允许跨条
+    assert locate_lines(_locate_cues(), "聊一聊人工智能的新进展", 100) == []
+    # 间隔 200ms：阈值恰为 200 时允许
+    hits = locate_lines(_locate_cues(), "聊一聊人工智能的新进展", 200)
+    assert len(hits) == 1
+    # 第 2、3 条间隔 3500ms：即使阈值 500，跨 2→3 的拼接匹配也不存在
+    assert locate_lines(_locate_cues(), "新进展人工智能", 500) == []
+
+
+def test_locate_overlap_in_time_allows_cross_cue():
+    # 后条开始早于前条结束（重叠）：间隔按零，阈值 0 也允许跨条
+    cues = parse_srt(
+        "1\n00:00:02,000 --> 00:00:04,000\n人工智能\n\n"
+        "2\n00:00:01,500 --> 00:00:03,000\n新进展\n"
+    )
+    hits = locate_lines(cues, "人工智能新进展", 0)
+    assert len(hits) == 1
+    assert hits[0].cross_cue
+    assert (hits[0].start, hits[0].end) == (2000, 3000)
+
+
+def test_locate_keeps_overlapping_hits():
+    # "ababa" 中查找 "aba"：起点 0 与起点 2 两处重叠命中都要返回
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:02,000\nababa\n")
+    hits = locate_lines(cues, "aba", 0)
+    assert len(hits) == 2
+    assert [h.snippet for h in hits] == ["aba", "aba"]
+
+
+def test_locate_overlap_can_cross_cue_boundary():
+    # 跨条 "ababa" + "ba"：起点 4 的命中跨条
+    cues = parse_srt(
+        "1\n00:00:00,000 --> 00:00:02,000\nababa\n\n"
+        "2\n00:00:02,000 --> 00:00:04,000\nba\n"
+    )
+    hits = locate_lines(cues, "aba", 0)
+    assert len(hits) == 3
+    cross = [h for h in hits if h.cross_cue]
+    assert len(cross) == 1
+    assert [(s.cue_order, s.snippet) for s in cross[0].segments] == [(1, "a"), (2, "ba")]
+
+
+def test_locate_snippet_keeps_internal_punctuation_excludes_neighbors():
+    # 命中范围内部的标点 / 空白保留，范围之外的相邻标点不带入
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:04,000\nHello,   world!!\n")
+    hits = locate_lines(cues, "helloworld", 0)
+    assert len(hits) == 1
+    assert hits[0].snippet == "Hello,   world"
+
+
+def test_locate_multiline_cue_snippet_preserves_newline():
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:04,000\n第一行\n第二行\n")
+    hits = locate_lines(cues, "第一行第二行", 0)
+    assert hits[0].snippet == "第一行\n第二行"
+
+
+def test_locate_punctuation_only_middle_cue_skipped_in_segments():
+    # 中间一条正文全是标点（归一化后为空字符）：跨条命中片段只含实际有命中的条，
+    # 时间区间仍从首条开始到末条结束
+    srt = (
+        "1\n00:00:00,000 --> 00:00:02,000\n你好世界\n\n"
+        "2\n00:00:02,100 --> 00:00:03,000\n！！\n\n"
+        "3\n00:00:03,000 --> 00:00:05,000\n再见\n"
+    )
+    hits = locate_lines(parse_srt(srt), "你好世界再见", 500)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert [s.cue_order for s in hit.segments] == [1, 3]
+    assert (hit.cue_order_from, hit.cue_order_to) == (1, 3)
+    assert (hit.start, hit.end) == (0, 5000)
+    assert hit.snippet == "你好世界再见"
+
+
+def test_locate_empty_after_normalize_raises():
+    with pytest.raises(LocateError):
+        locate_lines(_locate_cues(), " ，。！　\n\t", 0)
+    with pytest.raises(LocateError):
+        locate_lines(_locate_cues(), "", 0)
+
+
+def test_locate_casefold_and_punctuation_insensitive():
+    hits = locate_lines(_locate_cues(), "聊 一 聊，人工「智能」", 500)
+    assert len(hits) == 1
+    assert hits[0].snippet == "聊一聊人工智能"
+
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:02,000\ndie STRASSE ist lang\n")
+    hits = locate_lines(cues, "straße", 0)
+    assert len(hits) == 1
+    assert hits[0].snippet == "STRASSE"
+
+
+def test_locate_no_match_returns_empty():
+    assert locate_lines(_locate_cues(), "完全不存在的句子", 500) == []
+
+
+def test_locate_page_served():
+    resp = client.get("/locate")
+    assert resp.status_code == 200
+    assert "台词定位" in resp.text
+    assert "/api/locate" in resp.text
+
+
+def locate_body(**overrides):
+    body = {"srt": LOCATE_SRT, "query": "聊一聊人工智能的新进展", "max_gap_ms": 500}
+    body.update(overrides)
+    return body
+
+
+def test_api_locate_success_cross_cue():
+    resp = client.post("/api/locate", json=locate_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cue_count"] == 4
+    assert data["hit_count"] == 1
+    assert data["cross_cue_count"] == 1
+    assert data["normalized_query"] == "聊一聊人工智能的新进展"
+    hit = data["hits"][0]
+    assert hit["cross_cue"] is True
+    assert (hit["cue_order_from"], hit["cue_order_to"]) == (1, 2)
+    assert hit["start"] == "00:00:01,000"
+    assert hit["end"] == "00:00:05,500"
+    assert hit["snippet"] == "聊一聊人工智能的新进展"
+    assert [(s["cue_order"], s["snippet"], s["start"], s["end"]) for s in hit["segments"]] == [
+        (1, "聊一聊", "00:00:01,000", "00:00:03,000"),
+        (2, "人工智能的新进展", "00:00:03,200", "00:00:05,500"),
+    ]
+
+
+def test_api_locate_gap_threshold_changes_hits():
+    blocked = client.post("/api/locate", json=locate_body(max_gap_ms=100)).json()
+    assert blocked["hit_count"] == 0
+    allowed = client.post("/api/locate", json=locate_body(max_gap_ms=200)).json()
+    assert allowed["hit_count"] == 1
+
+
+def test_api_locate_rejects_empty_normalized_query():
+    resp = client.post("/api/locate", json=locate_body(query=" ，！ \n　"))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["type"] == "locate"
+    assert "空白" in detail["message"]
+
+
+def test_api_locate_validates_fields():
+    # 负间隔
+    resp = client.post("/api/locate", json=locate_body(max_gap_ms=-1))
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["field"] == "max_gap_ms"
+
+    # 小数间隔
+    resp = client.post("/api/locate", json=locate_body(max_gap_ms=1.5))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_gap_ms"
+
+    # 缺字段
+    assert client.post("/api/locate", json={"srt": LOCATE_SRT}).status_code == 422
+
+
+def test_api_locate_rejects_bad_srt():
+    resp = client.post("/api/locate", json=locate_body(srt="garbage"))
     assert resp.status_code == 422
     assert resp.json()["detail"]["type"] == "srt"

@@ -1,6 +1,6 @@
-# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴与镜头切点避让工具
+# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴、镜头切点避让与台词定位工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含十一个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含十二个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
@@ -51,6 +51,12 @@
     对全部字幕最小化起点挪动绝对值之和，同分取新起点序列字典序最小者，无解时指出最先
     无法继续安排的字幕输入序号。页面展示逐条原时间、新时间与偏移（前移负 / 后移正），
     并下载仅改时间轴的无损 SRT。
+12. **台词定位**（<http://localhost:8000/locate>）：粘贴 SRT，输入一句待查短台词与
+    允许跨条匹配的最大间隔毫秒数；按输入顺序拼接相邻字幕正文，仅在前条结束到后条开始
+    不超过阈值时允许跨条匹配（时间重叠视为间隔零），对短句与正文做 Unicode casefold
+    并忽略空白及 Unicode 标点类别字符，找出全部命中（含相互重叠的命中）；每处命中给出
+    原文片段、起止字幕输入序号与时间区间，跨条命中按各条实际命中范围截取、不带入相邻
+    文字，并可下载按命中顺序排列的 UTF-8 CSV 引用清单。
 
 ## 功能与校正规则（时间漂移）
 
@@ -356,6 +362,41 @@
   最大挪动量不在 0～2000、最小间隔为负、SRT 无法解析时，接口均返回 `422`
   （`detail.field` 指出字段，SRT 错误的 `detail.type` 为 `srt`）。
 
+## 功能与定位规则（台词定位）
+
+- 输入 SRT（复用同一套字幕解析器）、**待查短句** `query` 与非负整数
+  **允许跨条匹配的最大间隔** `max_gap_ms`（毫秒）。
+- 按输入顺序把字幕切成若干连续段：相邻两条之间仅当
+  **「后条开始 − 前条结束」不超过阈值**时允许同段跨条匹配；**时间重叠（含
+  开始时间倒序）视为间隔零**，即间隔按 `max(0, start_next − end_prev)` 计算。
+  间隔超过阈值的相邻字幕之间断开，跨断口的拼接匹配不可能命中。
+- 段内**按输入顺序直接拼接相邻字幕正文**（不插入分隔字符）；短句与拼接正文做
+  同样的归一化：逐字符判断，**Unicode 空白**（`str.isspace`，含换行、制表符、
+  全角空格等）与 **Unicode 标点类别字符**（`unicodedata.category` 以 `P` 开头，
+  覆盖中英文标点、引号、书名号等）一律剔除，其余字符做 **`casefold`** 折叠
+  （`Straße` 与 `STRASSE` 折叠后同为 `strasse`）；`casefold` 一对多展开时
+  每个折叠字符都映射回同一个原偏移。
+- **保留归一化字符到「拼接正文偏移 → 原字幕及该条正文内偏移」的映射**，在
+  归一化串上检索短句的**全部子串命中**：命中起点每次只前进一位，因此
+  **相互重叠的命中也全部返回**；命中按在字幕文档中的出现顺序编号。
+- **空白标点剔除后为空的短句**（空串或仅含空白 / 标点）拒绝生成并返回 `422`
+  （`detail.type` 为 `locate`，`detail.message` 给出中文原因）。
+- 每处命中返回：命中序号 `order`、是否跨条 `cross_cue`、**起止字幕输入序号**
+  `cue_order_from` / `cue_order_to`（从 1 开始，与 SRT 自身序号无关）、
+  **时间区间** `start` / `end`（首片段所在条的开始 → 末片段所在条的结束，
+  `HH:MM:SS,mmm`）、拼接后的**原文片段** `snippet`，以及逐片段明细 `segments`
+  （输入序号、SRT 序号、该条起止时间、该条片段原文 `snippet` 与该片段覆盖的
+  归一化字符数 `match_length`）。
+- **跨条命中按各条实际命中范围截取**：片段原文取该条内首个到末个命中归一化
+  字符对应的原偏移范围（含范围内部的空白 / 标点与多行换行），**不带入该条
+  相邻文字**；命中范围跳过的纯标点字幕不产生片段，但时间区间仍覆盖首末条。
+- 页面以命中清单（命中序号、单条 / 跨条标记、输入序号范围、时间区间、逐条
+  片段原文）展示结果，未命中时给出提示；「下载 CSV 引用清单」为
+  **UTF-8（含 BOM，Excel 可直接打开）、CRLF 换行**，按命中顺序排列，跨条
+  命中每个片段一行，含逗号 / 双引号 / 换行的内容按 RFC 4180 规则转义。
+  间隔不是非负整数或 SRT 无法解析时，接口返回 `422`（字段校验由
+  `detail.field` 指出字段，SRT 错误的 `detail.type` 为 `srt`）。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -375,6 +416,7 @@ docker compose up -d --build
 - 重叠字幕择优保留界面：<http://localhost:8000/selection>
 - 删段后字幕接轴界面：<http://localhost:8000/cut-rejoin>
 - 镜头切点避让界面：<http://localhost:8000/cut-avoid>
+- 台词定位界面：<http://localhost:8000/locate>
 - 时间漂移接口：`POST` <http://localhost:8000/api/correct>
 - 位置规划接口：`POST` <http://localhost:8000/api/placement>
 - 阅读负荷接口：`POST` <http://localhost:8000/api/reading-load>
@@ -386,6 +428,7 @@ docker compose up -d --build
 - 重叠字幕择优保留接口：`POST` <http://localhost:8000/api/selection>
 - 删段后字幕接轴接口：`POST` <http://localhost:8000/api/cut-rejoin>
 - 镜头切点避让接口：`POST` <http://localhost:8000/api/cut-avoid>
+- 台词定位接口：`POST` <http://localhost:8000/api/locate>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -408,8 +451,8 @@ HOST_PORT=9000 docker compose up -d --build
 # http://localhost:9000/reading-load 、http://localhost:9000/terms 、
 # http://localhost:9000/wrap 、http://localhost:9000/chapters 、
 # http://localhost:9000/topic-clip 、http://localhost:9000/bilingual-align 、
-# http://localhost:9000/selection 、http://localhost:9000/cut-rejoin
-# 与 http://localhost:9000/cut-avoid
+# http://localhost:9000/selection 、http://localhost:9000/cut-rejoin 、
+# http://localhost:9000/cut-avoid 与 http://localhost:9000/locate
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -423,8 +466,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 <http://localhost:8000/reading-load>、<http://localhost:8000/terms>、
 <http://localhost:8000/wrap>、<http://localhost:8000/chapters>、
 <http://localhost:8000/topic-clip>、<http://localhost:8000/bilingual-align>、
-<http://localhost:8000/selection>、<http://localhost:8000/cut-rejoin>
-与 <http://localhost:8000/cut-avoid>。
+<http://localhost:8000/selection>、<http://localhost:8000/cut-rejoin>、
+<http://localhost:8000/cut-avoid> 与 <http://localhost:8000/locate>。
 
 ## HTTP 接口
 
@@ -751,12 +794,43 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 最小间隔为负时返回 `422`（`detail.field` 分别指出 `cut_points` /
 `max_move_ms` / `min_gap_ms`），SRT 解析失败时 `detail.type` 为 `srt`。
 
+### `POST /api/locate`
+
+```json
+{
+  "srt": "1\n00:00:01,000 --> 00:00:03,000\n今天我们来聊一聊\n\n2\n00:00:03,200 --> 00:00:05,500\n人工智能的新进展\n",
+  "query": "聊一聊 人工智能！",
+  "max_gap_ms": 500
+}
+```
+
+`query` 为待查短台词（与正文同样做 Unicode `casefold`，匹配时忽略空白与
+Unicode 标点类别字符），`max_gap_ms` 为允许跨条匹配的非负整数最大间隔
+（后条开始 − 前条结束；时间重叠视为 0）。成功返回：
+
+- `hits`：全部命中（含相互重叠的命中），按文档出现顺序排列，每项含 `order`
+  （命中序号）、`cross_cue`（是否跨条）、`cue_order_from` / `cue_order_to`
+  （起止字幕输入序号，从 1 开始的闭区间）、`start` / `end`（首片段所在条
+  开始 → 末片段所在条结束，`HH:MM:SS,mmm`）、`snippet`（各条片段直接拼接
+  的原文）与 `segments`；
+- `segments`：命中在各条字幕上的实际片段，每个含 `cue_order`、`index`、
+  `start` / `end`、`snippet`（该条内实际命中范围，含范围内空白 / 标点与
+  换行，不带入相邻文字）与 `match_length`（该片段覆盖的归一化字符数）；
+- `normalized_query`（归一化后的短句，便于页面回显）、回显的 `max_gap_ms`、
+  `cue_count`、`hit_count` 与 `cross_cue_count`；未命中时 `hits` 为空数组。
+
+**短句在忽略空白与标点后为空**（空串或仅含空白 / 标点）时返回 `422`
+（`detail.type` 为 `locate`）；`max_gap_ms` 不是非负整数由字段校验拦截
+（`detail.field` 为 `max_gap_ms`）；SRT 解析失败时 `detail.type` 为 `srt`。
+页面下载的 UTF-8 CSV 引用清单（`locate.csv`，含 BOM、CRLF 换行）即由该
+响应在浏览器端生成：按命中顺序排列，跨条命中每个片段一行。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip、/api/bilingual-align、/api/selection、/api/cut-rejoin 与 /api/cut-avoid 接口
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip、/api/bilingual-align、/api/selection、/api/cut-rejoin、/api/cut-avoid 与 /api/locate 接口
 │   ├── mapping.py        # 锚点校验与分段线性映射
 │   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
 │   ├── reading_load.py   # 字 / 秒速率、半开时间轴事件扫描、热区合并与最短时长过滤
@@ -768,6 +842,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── selection.py      # 重叠字幕择优保留 DP（优先级 / 条数 / 序号字典序三级编码加权区间调度）
 │   ├── cutrejoin.py      # 删除区间校验合并、字幕裁切拆分与按累计删除时长前移接轴
 │   ├── cutavoid.py       # 镜头切点校验、最早可行起点可行性贪心与切点避让 DP（绝对值挪动量 + 起点序列字典序）
+│   ├── locate.py         # 短句归一化（casefold、忽略空白与 Unicode 标点）与偏移映射、间隔阈值连续段拼接及全部（含重叠）命中
 │   ├── srt.py            # SRT 解析、正文行定位与无损重写（保留原格式）
 │   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
@@ -781,7 +856,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │       ├── bilingual_align.html  # 双语字幕配对页面（原生 HTML/CSS/JS）
 │       ├── selection.html     # 重叠字幕择优保留页面（原生 HTML/CSS/JS）
 │       ├── cut_rejoin.html    # 删段后字幕接轴页面（原生 HTML/CSS/JS）
-│       └── cut_avoid.html     # 镜头切点避让页面（原生 HTML/CSS/JS）
+│       ├── cut_avoid.html     # 镜头切点避让页面（原生 HTML/CSS/JS）
+│       └── locate.html        # 台词定位页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml

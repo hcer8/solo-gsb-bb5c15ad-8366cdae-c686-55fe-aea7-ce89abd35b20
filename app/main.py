@@ -32,6 +32,7 @@ from .placement import (
     plan_positions,
 )
 from . import linewrap, terms as terms_lib
+from .locate import LocateError, locate_lines, normalize as normalize_query
 from .reading_load import find_reading_zones
 from .selection import SelectionError, select_cues
 from .srt import Cue, SrtParseError, format_srt, parse_document, parse_srt, rewrite_srt
@@ -46,7 +47,7 @@ from .topic_clip import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴与镜头切点避让工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴、镜头切点避让与台词定位工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
     "统一专名别名、分析重叠字幕叠加后的阅读负荷热区、按列数 / 行数限制智能断行、"
     "按章节数与优选停顿把整段字幕切成时长均衡的连续章节、"
@@ -54,8 +55,9 @@ app = FastAPI(
     "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段、"
     "把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对，"
     "按若干删除区间裁切字幕、拆分跨区间条目并按累计删除时长前移接轴，"
-    "或在有限挪动范围内整体平移字幕以避开镜头切点并满足相邻最小间隔。",
-    version="1.10.0",
+    "在有限挪动范围内整体平移字幕以避开镜头切点并满足相邻最小间隔，"
+    "或按间隔阈值在相邻字幕正文拼接串中定位一句短台词的全部出现位置。",
+    version="1.11.0",
 )
 
 _FIELD_LABELS = {
@@ -78,6 +80,8 @@ _FIELD_LABELS = {
     "cuts": "删除区间",
     "cut_points": "镜头切点",
     "max_move_ms": "最大挪动量",
+    "query": "待查短句",
+    "max_gap_ms": "允许跨条匹配的最大间隔毫秒数",
 }
 
 
@@ -588,6 +592,44 @@ class CutAvoidResponse(BaseModel):
     cues: list[CutAvoidCueView]
 
 
+class LocateRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    query: str = Field(..., description="待查短台词句")
+    max_gap_ms: StrictInt = Field(
+        ..., ge=0, description="允许跨条匹配的最大间隔（非负整数毫秒）"
+    )
+
+
+class LocateSegmentView(BaseModel):
+    cue_order: int
+    index: str
+    start: str
+    end: str
+    snippet: str
+    match_length: int
+
+
+class LocateHitView(BaseModel):
+    order: int
+    cross_cue: bool
+    cue_order_from: int
+    cue_order_to: int
+    start: str
+    end: str
+    snippet: str
+    segments: list[LocateSegmentView]
+
+
+class LocateResponse(BaseModel):
+    query: str
+    normalized_query: str
+    max_gap_ms: int
+    cue_count: int
+    hit_count: int
+    cross_cue_count: int
+    hits: list[LocateHitView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -646,6 +688,11 @@ def cut_rejoin_page() -> FileResponse:
 @app.get("/cut-avoid")
 def cut_avoid_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "cut_avoid.html")
+
+
+@app.get("/locate")
+def locate_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "locate.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -1346,4 +1393,56 @@ def cut_avoid(req: CutAvoidRequest) -> CutAvoidResponse | JSONResponse:
         total_shift_ms=plan.total_shift_ms,
         adjusted_srt=result_srt,
         cues=cue_views,
+    )
+
+
+@app.post("/api/locate", response_model=LocateResponse)
+def locate(req: LocateRequest) -> LocateResponse | JSONResponse:
+    # 1. 复用现有 SRT 解析器
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 2. 短句与正文统一 casefold、忽略空白与 Unicode 标点后做包含匹配；
+    #    归一化后短句为空（空串 / 纯空白标点）返回 422
+    try:
+        hits = locate_lines(cues, req.query, req.max_gap_ms)
+    except LocateError as exc:
+        raise HTTPException(
+            status_code=422, detail={"type": "locate", "message": str(exc)}
+        )
+
+    hit_views = [
+        LocateHitView(
+            order=hit.order,
+            cross_cue=hit.cross_cue,
+            cue_order_from=hit.cue_order_from,
+            cue_order_to=hit.cue_order_to,
+            start=format_timecode(hit.start),
+            end=format_timecode(hit.end),
+            snippet=hit.snippet,
+            segments=[
+                LocateSegmentView(
+                    cue_order=segment.cue_order,
+                    index=segment.index,
+                    start=format_timecode(segment.start),
+                    end=format_timecode(segment.end),
+                    snippet=segment.snippet,
+                    match_length=segment.match_length,
+                )
+                for segment in hit.segments
+            ],
+        )
+        for hit in hits
+    ]
+
+    return LocateResponse(
+        query=req.query,
+        normalized_query=normalize_query(req.query).text,
+        max_gap_ms=req.max_gap_ms,
+        cue_count=len(cues),
+        hit_count=len(hit_views),
+        cross_cue_count=sum(1 for v in hit_views if v.cross_cue),
+        hits=hit_views,
     )

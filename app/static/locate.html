@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>台词定位</title>
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --border: #d9dee8;
+    --text: #1f2733;
+    --muted: #6b7686;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
+    --danger-bg: #fef2f2;
+    --warn-bg: #fffbeb;
+    --warn-border: #f59e0b;
+    --ok-bg: #f0fdf4;
+    --ok-border: #16a34a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .nav { margin: 0 0 16px; font-size: 14px; }
+  .nav a { color: var(--primary); text-decoration: none; margin-right: 16px; }
+  .nav a:hover { text-decoration: underline; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: 13px; }
+  textarea {
+    width: 100%;
+    min-height: 240px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 13px/1.6 var(--mono);
+    resize: vertical;
+  }
+  input[type="text"] {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 14px var(--mono);
+  }
+  input[type="number"] {
+    width: 180px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 14px var(--mono);
+  }
+  textarea:focus, input:focus { outline: 2px solid rgba(37, 99, 235, .35); border-color: var(--primary); }
+  .params { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-end; }
+  .params .field { flex: 1 1 260px; }
+  button {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #f1f4f9; }
+  button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
+  }
+  button.primary:hover { background: var(--primary-hover); }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .alert {
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  .alert.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
+  .alert.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: #166534; }
+  .hidden { display: none; }
+  table.cues { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  table.cues th, table.cues td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.cues th { background: #f8fafc; }
+  table.cues td.num { color: var(--muted); text-align: right; white-space: nowrap; }
+  table.cues td.tc { font-family: var(--mono); white-space: nowrap; }
+  .kind {
+    display: inline-block;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    color: #1d4ed8;
+    border-radius: 999px;
+    padding: 0 8px;
+    font-size: 12px;
+    font-family: var(--mono);
+    white-space: nowrap;
+  }
+  .kind.cross { background: var(--warn-bg); border-color: var(--warn-border); color: #92400e; }
+  .seg { margin: 0 0 4px; }
+  .seg:last-child { margin-bottom: 0; }
+  .seg .meta { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .preview {
+    width: 100%;
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 12px/1.6 var(--mono);
+    background: #fafbfc;
+    white-space: pre;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="nav">
+    <a href="/">字幕时间漂移校正</a>
+    <a href="/placement">字幕位置规划</a>
+    <a href="/reading-load">阅读负荷热区</a>
+    <a href="/terms">字幕专名统一</a>
+    <a href="/wrap">字幕智能断行</a>
+    <a href="/chapters">章节规划</a>
+    <a href="/topic-clip">主题短片段检索</a>
+    <a href="/bilingual-align">双语字幕配对</a>
+    <a href="/selection">重叠字幕择优保留</a>
+    <a href="/cut-rejoin">删段后字幕接轴</a>
+    <a href="/cut-avoid">镜头切点避让</a>
+  </p>
+  <h1>台词定位</h1>
+  <p class="sub">粘贴 SRT 并输入一句待查短台词，系统按输入顺序拼接相邻字幕正文，仅在前条结束到
+    后条开始的间隔不超过给定阈值（毫秒，时间重叠视为间隔零）时允许跨条匹配。匹配时对短句与正文做
+    Unicode casefold，并忽略空白及 Unicode 标点类别字符；返回全部命中（含相互重叠的命中），每处
+    给出原文片段、起止字幕输入序号与时间区间，跨条命中按各条实际命中范围分别截取。结果可下载
+    按命中顺序排列的 UTF-8 CSV 引用清单。</p>
+
+  <div class="card">
+    <label for="srt">原始 SRT 字幕</label>
+    <textarea id="srt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:03,200 --> 00:00:05,000&#10;第二句字幕"></textarea>
+    <div class="toolbar">
+      <button type="button" id="fillExample">填入示例</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>定位参数</h2>
+    <div style="margin-bottom:16px;">
+      <label for="query">待查短台词
+        <span class="hint">与字幕正文同样做 Unicode casefold；匹配时忽略空白与 Unicode 标点（含中文标点）</span>
+      </label>
+      <input type="text" id="query" placeholder="例如：聊一聊人工智能的新进展" spellcheck="false">
+    </div>
+    <div class="params">
+      <div class="field">
+        <label for="maxGap">允许跨条匹配的最大间隔（毫秒，非负整数）
+          <span class="hint">后条开始 − 前条结束；时间重叠视为 0。超过该间隔的相邻字幕之间不允许跨条命中</span>
+        </label>
+        <input type="number" id="maxGap" min="0" step="1" value="500">
+      </div>
+    </div>
+  </div>
+
+  <div id="errorBox" class="alert error hidden"></div>
+
+  <div class="toolbar" style="margin-bottom: 20px;">
+    <button type="button" class="primary" id="submit">开始定位</button>
+    <span class="hint" id="status"></span>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>定位结果</h2>
+    <div id="okBox" class="alert ok hidden"></div>
+    <div class="toolbar" style="margin-top:0;">
+      <button type="button" class="primary" id="download">下载 CSV 引用清单</button>
+      <span class="hint">UTF-8（含 BOM，Excel 可直接打开），按命中顺序排列；跨条命中每个片段一行。</span>
+    </div>
+
+    <h2 style="margin-top:18px;">命中清单</h2>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th>命中序号</th>
+          <th>类型</th>
+          <th>输入序号</th>
+          <th>时间区间</th>
+          <th>原文片段（跨条按各条实际命中范围截取）</th>
+        </tr>
+      </thead>
+      <tbody id="hitRows"></tbody>
+    </table>
+
+    <h2 style="margin-top:18px;">CSV 预览</h2>
+    <pre class="preview" id="csvPreview"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  const srtEl = document.getElementById("srt");
+  const queryEl = document.getElementById("query");
+  const maxGapEl = document.getElementById("maxGap");
+  const errorBox = document.getElementById("errorBox");
+  const resultCard = document.getElementById("resultCard");
+  const okBox = document.getElementById("okBox");
+  const hitRowsEl = document.getElementById("hitRows");
+  const csvPreviewEl = document.getElementById("csvPreview");
+  const statusEl = document.getElementById("status");
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.remove("hidden");
+  }
+  function clearAlerts() {
+    errorBox.classList.add("hidden");
+    okBox.classList.add("hidden");
+    errorBox.textContent = "";
+    okBox.textContent = "";
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+  function brText(s) {
+    return escapeHtml(s).replace(/\n/g, "<br>");
+  }
+
+  const EXAMPLE_SRT =
+    "1\n00:00:01,000 --> 00:00:03,000\n今天我们来聊一聊\n\n" +
+    "2\n00:00:03,200 --> 00:00:05,500\n人工智能的新进展\n\n" +
+    "3\n00:00:09,000 --> 00:00:11,000\n人工智能，正在改变生活\n\n" +
+    "4\n00:00:11,000 --> 00:00:13,000\n的方方面面。\n";
+
+  document.getElementById("fillExample").addEventListener("click", () => {
+    srtEl.value = EXAMPLE_SRT;
+    queryEl.value = "聊一聊人工智能的新进展";
+    maxGapEl.value = "500";
+    clearAlerts();
+    resultCard.classList.add("hidden");
+  });
+
+  // CSV 单元格转义（RFC 4180）：含逗号、双引号或换行（\n / \r）时整体加引号，
+  // 内部双引号翻倍——多行片段由此保证不破坏行列结构
+  function csvCell(value) {
+    const s = value === null || value === undefined ? "" : String(value);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  // 一处命中可能对应多个片段（跨条）：每个片段一行，按命中顺序排列
+  function buildCsv(data) {
+    const header = [
+      "命中序号", "类型", "起输入序号", "止输入序号", "命中开始", "命中结束", "命中原文",
+      "片段输入序号", "片段SRT序号", "片段开始", "片段结束", "片段原文", "片段匹配字符数"
+    ];
+    const rows = [];
+    for (const h of data.hits) {
+      for (const seg of h.segments) {
+        rows.push([
+          h.order, h.cross_cue ? "跨条" : "单条",
+          h.cue_order_from, h.cue_order_to, h.start, h.end, h.snippet,
+          seg.cue_order, seg.index, seg.start, seg.end, seg.snippet, seg.match_length
+        ]);
+      }
+    }
+    return [header].concat(rows)
+      .map(r => r.map(csvCell).join(","))
+      .join("\r\n");
+  }
+
+  function renderHits(data) {
+    hitRowsEl.innerHTML = data.hits.map(h => {
+      const segs = h.segments.map(seg =>
+        '<p class="seg"><span class="meta">[' + seg.cue_order + "（SRT 序号 " +
+        escapeHtml(seg.index) + "） " + escapeHtml(seg.start) + " → " +
+        escapeHtml(seg.end) + "]</span> " + brText(seg.snippet) + "</p>"
+      ).join("");
+      return "<tr>" +
+        '<td class="num">' + h.order + "</td>" +
+        '<td><span class="kind' + (h.cross_cue ? " cross" : "") + '">' +
+          (h.cross_cue ? "跨条 ×" + (h.cue_order_to - h.cue_order_from + 1) : "单条") +
+        "</span></td>" +
+        '<td class="num">' + h.cue_order_from +
+          (h.cue_order_from === h.cue_order_to ? "" : "～" + h.cue_order_to) + "</td>" +
+        '<td class="tc">' + escapeHtml(h.start) + "<br>" + escapeHtml(h.end) + "</td>" +
+        "<td>" + segs + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  document.getElementById("submit").addEventListener("click", async () => {
+    clearAlerts();
+    resultCard.classList.add("hidden");
+    if (!srtEl.value.trim()) { showError("请粘贴 SRT 字幕。"); return; }
+    if (!queryEl.value.trim()) { showError("请输入待查短台词。"); return; }
+    if (!/^\d+$/.test(maxGapEl.value.trim())) {
+      showError("允许跨条匹配的最大间隔必须是非负整数毫秒。");
+      return;
+    }
+
+    statusEl.textContent = "定位中…";
+    try {
+      const resp = await fetch("/api/locate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          srt: srtEl.value,
+          query: queryEl.value,
+          max_gap_ms: Number(maxGapEl.value.trim())
+        })
+      });
+      const rawText = await resp.text();
+      let data;
+      try { data = JSON.parse(rawText); }
+      catch (_e) { data = null; }
+      if (!resp.ok) {
+        showError((data && data.detail && data.detail.message) ||
+          ("请求失败（HTTP " + resp.status + "）"));
+        statusEl.textContent = "";
+        return;
+      }
+
+      if (data.hit_count === 0) {
+        okBox.textContent =
+          "未在 " + data.cue_count + " 条字幕中找到该短句" +
+          "（归一化后为「" + data.normalized_query + "」，跨条最大间隔 " +
+          data.max_gap_ms + " 毫秒）。";
+      } else {
+        okBox.textContent =
+          "共找到 " + data.hit_count + " 处命中" +
+          (data.cross_cue_count ? "，其中跨条命中 " + data.cross_cue_count + " 处" : "") +
+          "（含相互重叠的命中；归一化短句为「" + data.normalized_query + "」）。";
+      }
+      okBox.classList.remove("hidden");
+
+      renderHits(data);
+
+      // 页面 CSV 预览与下载共用同一份内容
+      window.__locateCsv = buildCsv(data);
+      csvPreviewEl.textContent = window.__locateCsv;
+      resultCard.classList.remove("hidden");
+      statusEl.textContent = "";
+    } catch (err) {
+      showError("请求出错：" + err);
+      statusEl.textContent = "";
+    }
+  });
+
+  document.getElementById("download").addEventListener("click", () => {
+    // 前置 BOM 便于 Excel 按 UTF-8 打开中文
+    const content = "﻿" + (window.__locateCsv || "");
+    const blob = new Blob([content], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "locate.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>
