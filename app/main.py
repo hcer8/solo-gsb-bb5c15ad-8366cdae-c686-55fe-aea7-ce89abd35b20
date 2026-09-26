@@ -22,6 +22,7 @@ from .bilingual import (
 from .chapters import ChapterError, plan_chapters
 from .cutavoid import CutAvoidError, avoid_cuts
 from .cutrejoin import CutRejoinError, parse_cuts, rejoin_cues
+from . import linewrap, locate as locate_lib, terms as terms_lib
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
 from .placement import (
     Block,
@@ -31,7 +32,6 @@ from .placement import (
     parse_blocks,
     plan_positions,
 )
-from . import linewrap, terms as terms_lib
 from .reading_load import find_reading_zones
 from .selection import SelectionError, select_cues
 from .srt import Cue, SrtParseError, format_srt, parse_document, parse_srt, rewrite_srt
@@ -46,7 +46,7 @@ from .topic_clip import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴与镜头切点避让工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对、删段接轴、镜头切点避让与台词定位工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
     "统一专名别名、分析重叠字幕叠加后的阅读负荷热区、按列数 / 行数限制智能断行、"
     "按章节数与优选停顿把整段字幕切成时长均衡的连续章节、"
@@ -54,8 +54,9 @@ app = FastAPI(
     "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段、"
     "把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对，"
     "按若干删除区间裁切字幕、拆分跨区间条目并按累计删除时长前移接轴，"
-    "或在有限挪动范围内整体平移字幕以避开镜头切点并满足相邻最小间隔。",
-    version="1.10.0",
+    "在有限挪动范围内整体平移字幕以避开镜头切点并满足相邻最小间隔，"
+    "或按短句在拼接字幕正文中做忽略大小写 / 空白 / 标点的台词定位（可跨间隔不超阈值的相邻字幕）。",
+    version="1.11.0",
 )
 
 _FIELD_LABELS = {
@@ -78,6 +79,8 @@ _FIELD_LABELS = {
     "cuts": "删除区间",
     "cut_points": "镜头切点",
     "max_move_ms": "最大挪动量",
+    "query": "待查短句",
+    "max_gap_ms": "最大间隔毫秒数",
 }
 
 
@@ -588,6 +591,40 @@ class CutAvoidResponse(BaseModel):
     cues: list[CutAvoidCueView]
 
 
+class LocateRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    query: str = Field(
+        ..., description="待查短句（按 Unicode casefold 并忽略空白与标点后匹配）"
+    )
+    max_gap_ms: StrictInt = Field(
+        ..., ge=0, description="允许跨条匹配的最大间隔毫秒数（非负整数）"
+    )
+
+
+class LocateSegmentView(BaseModel):
+    cue_order: int
+    index: str
+    text: str
+
+
+class LocateHitView(BaseModel):
+    hit_order: int
+    cue_order_from: int
+    cue_order_to: int
+    start: str
+    end: str
+    segments: list[LocateSegmentView]
+
+
+class LocateResponse(BaseModel):
+    query: str
+    normalized_query: str
+    max_gap_ms: int
+    cue_count: int
+    hit_count: int
+    hits: list[LocateHitView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -646,6 +683,11 @@ def cut_rejoin_page() -> FileResponse:
 @app.get("/cut-avoid")
 def cut_avoid_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "cut_avoid.html")
+
+
+@app.get("/locate")
+def locate_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "locate.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -1346,4 +1388,55 @@ def cut_avoid(req: CutAvoidRequest) -> CutAvoidResponse | JSONResponse:
         total_shift_ms=plan.total_shift_ms,
         adjusted_srt=result_srt,
         cues=cue_views,
+    )
+
+
+@app.post("/api/locate", response_model=LocateResponse)
+def locate_lines(req: LocateRequest) -> LocateResponse | JSONResponse:
+    # 1. 先校验待查短句：按 Unicode casefold 折叠并剔除空白 / Unicode 标点后
+    #    为空的短句属于参数错误（422，detail.type 为 query）
+    try:
+        needle = locate_lib.normalize_query(req.query)
+    except locate_lib.LocateError as exc:
+        raise HTTPException(status_code=422, detail={"type": "query", "message": str(exc)})
+
+    # 2. 复用现有 SRT 解析器
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 3. 按输入顺序拼接相邻字幕的归一化正文（仅间隔不超过阈值的相邻字幕允许
+    #    跨条，重叠时间按间隔 0 计），找出全部命中（含重叠命中），并借
+    #    「归一化字符 -> 原字幕 / 原正文偏移」映射拆回各条实际命中范围
+    hits = locate_lib.find_line_hits(cues, needle, req.max_gap_ms)
+
+    hit_views: list[LocateHitView] = []
+    for hit in hits:
+        segments = [
+            LocateSegmentView(
+                cue_order=seg.cue_order,
+                index=cues[seg.cue_order - 1].index,
+                text=cues[seg.cue_order - 1].text[seg.start_offset : seg.end_offset],
+            )
+            for seg in hit.segments
+        ]
+        hit_views.append(
+            LocateHitView(
+                hit_order=hit.hit_order,
+                cue_order_from=hit.cue_order_from,
+                cue_order_to=hit.cue_order_to,
+                start=format_timecode(cues[hit.cue_order_from - 1].start),
+                end=format_timecode(cues[hit.cue_order_to - 1].end),
+                segments=segments,
+            )
+        )
+
+    return LocateResponse(
+        query=req.query,
+        normalized_query=needle,
+        max_gap_ms=req.max_gap_ms,
+        cue_count=len(cues),
+        hit_count=len(hit_views),
+        hits=hit_views,
     )

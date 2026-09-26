@@ -42,6 +42,12 @@ from app.linewrap import (
     plan_wrap,
     wrap_document,
 )
+from app.locate import (
+    LocateError,
+    find_line_hits,
+    normalize_query,
+    normalize_with_mapping,
+)
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
 from app.placement import (
     Block,
@@ -2948,3 +2954,286 @@ def test_api_cut_avoid_rejects_bad_srt():
     resp = client.post("/api/cut-avoid", json=cutavoid_body(srt="garbage"))
     assert resp.status_code == 422
     assert resp.json()["detail"]["type"] == "srt"
+
+
+# ---------- 台词定位 ----------
+
+LOCATE_SRT = (
+    "1\n00:00:01,000 --> 00:00:03,000\n今天天气真不错，\n\n"
+    "2\n00:00:03,200 --> 00:00:05,000\n我们一起去公园吧！\n\n"
+    "3\n00:00:09,000 --> 00:00:11,000\n明天可能要下雨\n"
+)
+
+
+def test_normalize_with_mapping_strips_and_maps():
+    norm, offsets = normalize_with_mapping("A b，c！")
+    assert norm == "abc"
+    assert offsets == [0, 2, 4]
+
+
+def test_normalize_with_mapping_casefold_expansion():
+    # ß casefold 展开为 ss，展开字符映射回同一原文偏移
+    norm, offsets = normalize_with_mapping("Straße")
+    assert norm == "strasse"
+    assert offsets == [0, 1, 2, 3, 4, 4, 5]
+
+
+def test_normalize_query_rejects_empty_after_stripping():
+    for bad in ("", "   ", "，。！", " \t\n ", "…"):
+        with pytest.raises(LocateError):
+            normalize_query(bad)
+
+
+def test_normalize_query_folds_and_strips():
+    assert normalize_query(" 不错，我们一起 ") == "不错我们一起"
+    assert normalize_query("STRASSE") == "strasse"
+
+
+def test_find_line_hits_single_cue_ignores_punct_and_space():
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:02,000\nHello, world!\n")
+    hits = find_line_hits(cues, normalize_query("helloworld"), 0)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert (hit.cue_order_from, hit.cue_order_to) == (1, 1)
+    # 片段覆盖首末命中字符之间的原文（中间的标点 / 空格自然包含）
+    seg = hit.segments[0]
+    assert cues[0].text[seg.start_offset:seg.end_offset] == "Hello, world"
+
+
+def test_find_line_hits_overlapping():
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:02,000\naaaa\n")
+    hits = find_line_hits(cues, normalize_query("aa"), 0)
+    assert [h.hit_order for h in hits] == [1, 2, 3]
+    assert [
+        (h.segments[0].start_offset, h.segments[0].end_offset) for h in hits
+    ] == [(0, 2), (1, 3), (2, 4)]
+
+
+def test_find_line_hits_cross_cue_within_gap():
+    cues = parse_srt(LOCATE_SRT)
+    # 第 1 条结束 3000 → 第 2 条开始 3200，间隔 200 ≤ 500，允许跨条
+    hits = find_line_hits(cues, normalize_query("不错，我们一起"), 500)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert (hit.cue_order_from, hit.cue_order_to) == (1, 2)
+    # 跨条命中按各条实际命中范围截取，不带入相邻文字
+    frags = [
+        cues[s.cue_order - 1].text[s.start_offset:s.end_offset]
+        for s in hit.segments
+    ]
+    assert frags == ["不错", "我们一起"]
+
+
+def test_find_line_hits_cross_cue_blocked_by_gap():
+    cues = parse_srt(LOCATE_SRT)
+    # 第 2 条结束 5000 → 第 3 条开始 9000，间隔 4000 > 500，不允许跨条
+    assert find_line_hits(cues, normalize_query("吧明天"), 500) == []
+    # 间隔恰好等于阈值时允许跨条
+    hits = find_line_hits(cues, normalize_query("吧明天"), 4000)
+    assert len(hits) == 1
+    assert (hits[0].cue_order_from, hits[0].cue_order_to) == (2, 3)
+    frags = [
+        cues[s.cue_order - 1].text[s.start_offset:s.end_offset]
+        for s in hits[0].segments
+    ]
+    assert frags == ["吧", "明天"]
+
+
+def test_find_line_hits_time_overlap_counts_as_zero_gap():
+    srt = (
+        "1\n00:00:01,000 --> 00:00:05,000\n前半句 abc\n\n"
+        "2\n00:00:04,000 --> 00:00:08,000\ndef 后半句\n"
+    )
+    cues = parse_srt(srt)
+    # 两条时间重叠（间隔按 0 计），阈值为 0 也允许跨条
+    hits = find_line_hits(cues, normalize_query("abcdef"), 0)
+    assert len(hits) == 1
+    frags = [
+        cues[s.cue_order - 1].text[s.start_offset:s.end_offset]
+        for s in hits[0].segments
+    ]
+    assert frags == ["abc", "def"]
+
+
+def test_find_line_hits_spans_three_cues():
+    srt = (
+        "1\n00:00:00,000 --> 00:00:01,000\n甲一\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\n乙二\n\n"
+        "3\n00:00:02,000 --> 00:00:03,000\n丙三\n"
+    )
+    cues = parse_srt(srt)
+    hits = find_line_hits(cues, normalize_query("一乙二丙"), 0)
+    assert len(hits) == 1
+    assert (hits[0].cue_order_from, hits[0].cue_order_to) == (1, 3)
+    frags = [
+        cues[s.cue_order - 1].text[s.start_offset:s.end_offset]
+        for s in hits[0].segments
+    ]
+    assert frags == ["一", "乙二", "丙"]
+
+
+def test_find_line_hits_casefold_match():
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:02,000\nStraße 来了\n")
+    hits = find_line_hits(cues, normalize_query("STRASSE"), 0)
+    assert len(hits) == 1
+    seg = hits[0].segments[0]
+    assert cues[0].text[seg.start_offset:seg.end_offset] == "Straße"
+
+
+def test_find_line_hits_skips_punct_only_cue():
+    srt = (
+        "1\n00:00:00,000 --> 00:00:01,000\n开始 ab\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\n！！！\n\n"
+        "3\n00:00:02,000 --> 00:00:03,000\ncd 结束\n"
+    )
+    cues = parse_srt(srt)
+    hits = find_line_hits(cues, normalize_query("abcd"), 10)
+    assert len(hits) == 1
+    # 中间纯标点字幕没有归一化字符，命中直接从第 1 条跨到第 3 条
+    assert (hits[0].cue_order_from, hits[0].cue_order_to) == (1, 3)
+    assert [s.cue_order for s in hits[0].segments] == [1, 3]
+
+
+def test_find_line_hits_ordered_by_position():
+    srt = (
+        "1\n00:00:00,000 --> 00:00:01,000\nx 目标\n\n"
+        "2\n00:00:05,000 --> 00:00:06,000\n目标 y 目标\n"
+    )
+    cues = parse_srt(srt)
+    hits = find_line_hits(cues, normalize_query("目标"), 0)
+    assert [(h.cue_order_from, h.segments[0].start_offset) for h in hits] == [
+        (1, 2), (2, 0), (2, 5),
+    ]
+
+
+def test_find_line_hits_rejects_empty_needle():
+    cues = parse_srt(LOCATE_SRT)
+    with pytest.raises(LocateError):
+        find_line_hits(cues, "", 0)
+
+
+def test_locate_page_served():
+    resp = client.get("/locate")
+    assert resp.status_code == 200
+    assert "台词定位" in resp.text
+    assert "/api/locate" in resp.text
+
+
+def locate_body(**overrides):
+    body = {"srt": LOCATE_SRT, "query": "不错，我们一起", "max_gap_ms": 500}
+    body.update(overrides)
+    return body
+
+
+def test_api_locate_success_cross_cue():
+    resp = client.post("/api/locate", json=locate_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["query"] == "不错，我们一起"
+    assert data["normalized_query"] == "不错我们一起"
+    assert data["max_gap_ms"] == 500
+    assert data["cue_count"] == 3
+    assert data["hit_count"] == 1
+    hit = data["hits"][0]
+    assert hit["hit_order"] == 1
+    assert hit["cue_order_from"] == 1 and hit["cue_order_to"] == 2
+    # 时间区间：首条命中字幕的开始 → 末条命中字幕的结束
+    assert hit["start"] == "00:00:01,000"
+    assert hit["end"] == "00:00:05,000"
+    # 跨条命中按各条实际命中范围截取，不带入相邻文字
+    assert [(s["cue_order"], s["index"], s["text"]) for s in hit["segments"]] == [
+        (1, "1", "不错"),
+        (2, "2", "我们一起"),
+    ]
+
+
+def test_api_locate_gap_boundary_and_no_hit():
+    # 间隔 4000 > 500：不允许跨条，无命中
+    resp = client.post("/api/locate", json=locate_body(query="吧明天"))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hit_count"] == 0 and data["hits"] == []
+
+    # 间隔恰好等于阈值：允许跨条
+    resp = client.post("/api/locate", json=locate_body(query="吧明天", max_gap_ms=4000))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["hit_count"] == 1
+    hit = data["hits"][0]
+    assert (hit["cue_order_from"], hit["cue_order_to"]) == (2, 3)
+    assert hit["start"] == "00:00:03,200" and hit["end"] == "00:00:11,000"
+    assert [s["text"] for s in hit["segments"]] == ["吧", "明天"]
+
+
+def test_api_locate_overlapping_hits_in_order():
+    srt = (
+        "1\n00:00:00,000 --> 00:00:02,000\naaaa\n\n"
+        "2\n00:00:05,000 --> 00:00:07,000\nAA\n"
+    )
+    resp = client.post(
+        "/api/locate", json=locate_body(srt=srt, query="aa", max_gap_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 含重叠命中：aaaa 中 3 处 + AA（casefold）1 处，按命中顺序排列
+    assert data["hit_count"] == 4
+    assert [
+        (h["hit_order"], h["cue_order_from"], h["segments"][0]["text"])
+        for h in data["hits"]
+    ] == [(1, 1, "aa"), (2, 1, "aa"), (3, 1, "aa"), (4, 2, "AA")]
+    assert data["hits"][3]["start"] == "00:00:05,000"
+    assert data["hits"][3]["end"] == "00:00:07,000"
+
+
+def test_api_locate_casefold_and_punct_insensitive():
+    srt = "1\n00:00:00,000 --> 00:00:02,000\nStraße 来了，Hello, world!\n"
+    resp = client.post(
+        "/api/locate", json=locate_body(srt=srt, query="STRASSE", max_gap_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    hit = resp.json()["hits"][0]
+    assert hit["segments"][0]["text"] == "Straße"
+
+    resp = client.post(
+        "/api/locate", json=locate_body(srt=srt, query="hello world", max_gap_ms=0)
+    )
+    assert resp.status_code == 200, resp.text
+    hit = resp.json()["hits"][0]
+    assert hit["segments"][0]["text"] == "Hello, world"
+
+
+def test_api_locate_rejects_empty_query():
+    for bad in ("", "   ", "，。！"):
+        resp = client.post("/api/locate", json=locate_body(query=bad))
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["type"] == "query"
+
+
+def test_api_locate_rejects_bad_gap():
+    # 负间隔
+    resp = client.post("/api/locate", json=locate_body(max_gap_ms=-1))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_gap_ms"
+
+    # 小数间隔
+    resp = client.post("/api/locate", json=locate_body(max_gap_ms=1.5))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_gap_ms"
+
+    # 字符串间隔
+    resp = client.post("/api/locate", json=locate_body(max_gap_ms="500"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_gap_ms"
+
+
+def test_api_locate_rejects_bad_srt():
+    resp = client.post("/api/locate", json=locate_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_locate_requires_fields():
+    assert client.post("/api/locate", json={"srt": LOCATE_SRT}).status_code == 422
+    assert client.post(
+        "/api/locate", json={"query": "不错", "max_gap_ms": 0}
+    ).status_code == 422
